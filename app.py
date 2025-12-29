@@ -1,48 +1,54 @@
+import asyncio
 import os
-import logging
+import json
 from datetime import datetime
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.fsm.state import State, StatesGroup
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.storage.memory import MemoryStorage
-
-from dotenv import load_dotenv
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 
-# ================== НАСТРОЙКИ ==================
-
-load_dotenv()
-
+# =======================
+# ENV
+# =======================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME")
+GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
-logging.basicConfig(level=logging.INFO)
+if not all([BOT_TOKEN, SPREADSHEET_NAME, GOOGLE_CREDENTIALS_JSON]):
+    raise RuntimeError("ENV variables are not set")
 
-# ================== GOOGLE SHEETS ==================
+# =======================
+# Google Sheets
+# =======================
+creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
 
-scope = [
-    "https://spreadsheets.google.com/feeds",
+scopes = [
+    "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
 
-creds = ServiceAccountCredentials.from_json_keyfile_name(
-    "credentials.json", scope
+credentials = Credentials.from_service_account_info(
+    creds_dict,
+    scopes=scopes
 )
 
-client = gspread.authorize(creds)
-sheet = client.open(SPREADSHEET_NAME).sheet1
+gc = gspread.authorize(credentials)
+sheet = gc.open(SPREADSHEET_NAME).sheet1
 
-# ================== BOT ==================
+# =======================
+# Bot
+# =======================
+bot = Bot(BOT_TOKEN)
+dp = Dispatcher()
 
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
-
-# ================== FSM ==================
-
+# =======================
+# States
+# =======================
 class Form(StatesGroup):
     date = State()
     type = State()
@@ -50,8 +56,9 @@ class Form(StatesGroup):
     category = State()
     comment = State()
 
-# ================== КНОПКИ ==================
-
+# =======================
+# Keyboards
+# =======================
 cancel_kb = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="❌ Отмена")]],
     resize_keyboard=True
@@ -60,114 +67,95 @@ cancel_kb = ReplyKeyboardMarkup(
 type_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="➕ Доход"), KeyboardButton(text="➖ Расход")],
-        [KeyboardButton(text="❌ Отмена")]
+        [KeyboardButton(text="⬅️ Назад"), KeyboardButton(text="❌ Отмена")]
     ],
     resize_keyboard=True
 )
 
-# ================== /start ==================
-
-@dp.message(F.text == "/start")
-async def start(message: Message, state: FSMContext):
+# =======================
+# Handlers
+# =======================
+@dp.message(Command("start"))
+async def start(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        "Привет! 👋\n\n"
-        "Я бот учёта бюджета 💰\n"
-        "Нажми /add чтобы добавить запись."
-    )
-
-# ================== /add ==================
-
-@dp.message(F.text == "/add")
-async def add_start(message: Message, state: FSMContext):
-    await state.set_state(Form.date)
-    await message.answer(
-        "Введите дату в формате ДД.ММ.ГГГГ\n"
-        "Или отправьте «сегодня»",
+        "Привет 👋\nВведи дату в формате ДД.ММ.ГГГГ",
         reply_markup=cancel_kb
     )
+    await state.set_state(Form.date)
 
-# ================== ОТМЕНА ==================
-
-@dp.message(F.text == "❌ Отмена")
-async def cancel(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Действие отменено ❌", reply_markup=None)
-
-# ================== ДАТА ==================
 
 @dp.message(Form.date)
-async def process_date(message: Message, state: FSMContext):
-    text = message.text.strip()
+async def get_date(message: types.Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer("Действие отменено", reply_markup=types.ReplyKeyboardRemove())
+        return
 
-    if text.lower() == "сегодня":
-        date = datetime.now().strftime("%d.%m.%Y")
-    else:
-        try:
-            datetime.strptime(text, "%d.%m.%Y")
-            date = text
-        except ValueError:
-            await message.answer("❗ Неверный формат даты. Попробуй ещё раз.")
-            return
+    try:
+        date = datetime.strptime(message.text, "%d.%m.%Y").date()
+    except ValueError:
+        await message.answer("Неверный формат даты. Пример: 25.12.2025")
+        return
 
-    await state.update_data(date=date)
+    await state.update_data(date=str(date))
+    await message.answer("Выбери тип:", reply_markup=type_kb)
     await state.set_state(Form.type)
 
-    await message.answer(
-        "Выберите тип:",
-        reply_markup=type_kb
-    )
-
-# ================== ТИП ==================
 
 @dp.message(Form.type)
-async def process_type(message: Message, state: FSMContext):
+async def get_type(message: types.Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer("Отменено", reply_markup=types.ReplyKeyboardRemove())
+        return
+
+    if message.text == "⬅️ Назад":
+        await message.answer("Введи дату:")
+        await state.set_state(Form.date)
+        return
+
     if message.text not in ["➕ Доход", "➖ Расход"]:
-        await message.answer("Выберите кнопку 👇")
+        await message.answer("Выбери кнопкой")
         return
 
     await state.update_data(type=message.text.replace("➕ ", "").replace("➖ ", ""))
+    await message.answer("Введи сумму:")
     await state.set_state(Form.amount)
 
-    await message.answer(
-        "Введите сумму:",
-        reply_markup=cancel_kb
-    )
-
-# ================== СУММА ==================
 
 @dp.message(Form.amount)
-async def process_amount(message: Message, state: FSMContext):
+async def get_amount(message: types.Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer("Отменено", reply_markup=types.ReplyKeyboardRemove())
+        return
+
     try:
         amount = float(message.text.replace(",", "."))
     except ValueError:
-        await message.answer("Введите число ❗")
+        await message.answer("Введи число")
         return
 
     await state.update_data(amount=amount)
+    await message.answer("Категория:")
     await state.set_state(Form.category)
 
-    await message.answer(
-        "Введите категорию:",
-        reply_markup=cancel_kb
-    )
-
-# ================== КАТЕГОРИЯ ==================
 
 @dp.message(Form.category)
-async def process_category(message: Message, state: FSMContext):
+async def get_category(message: types.Message, state: FSMContext):
+    if message.text == "❌ Отмена":
+        await state.clear()
+        await message.answer("Отменено", reply_markup=types.ReplyKeyboardRemove())
+        return
+
     await state.update_data(category=message.text)
+    await message.answer("Комментарий (или '-'):")
     await state.set_state(Form.comment)
 
-    await message.answer(
-        "Комментарий (или «-»):",
-        reply_markup=cancel_kb
-    )
-
-# ================== КОММЕНТАРИЙ + ЗАПИСЬ ==================
 
 @dp.message(Form.comment)
-async def process_comment(message: Message, state: FSMContext):
+async def finish(message: types.Message, state: FSMContext):
     data = await state.get_data()
 
     row = [
@@ -181,24 +169,18 @@ async def process_comment(message: Message, state: FSMContext):
 
     sheet.append_row(row)
 
+    await state.clear()
     await message.answer(
-        "✅ Запись добавлена!\n\n"
-        f"📅 {data['date']}\n"
-        f"👤 {message.from_user.full_name}\n"
-        f"📌 {data['type']}\n"
-        f"💰 {data['amount']}\n"
-        f"🏷 {data['category']}\n"
-        f"💬 {message.text}",
-        reply_markup=None
+        "✅ Запись сохранена",
+        reply_markup=types.ReplyKeyboardRemove()
     )
 
-    await state.clear()
 
-# ================== RUN ==================
-
+# =======================
+# Main
+# =======================
 async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
