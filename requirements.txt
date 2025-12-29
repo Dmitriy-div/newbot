@@ -1,4 +1,4 @@
 aiogram==3.4.1
-python-dotenv
-gspread
-oauth2client
+gspread==5.12.0
+google-auth==2.29.0
+python-dotenv==1.0.1
